@@ -1,0 +1,767 @@
+import cv2
+import math
+import numpy as np
+from ultralytics import YOLO
+from collections import deque
+import time
+import json
+from datetime import datetime, timedelta
+import csv
+
+# ----- Angle Utilities -----
+def angle_between_vectors(v1, v2):
+    """Calculate angle between two vectors"""
+    v1_u = v1 / np.linalg.norm(v1)
+    v2_u = v2 / np.linalg.norm(v2)
+    angle_rad = np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0))
+    return np.degrees(angle_rad)
+
+def get_neck_angle(nose, shoulder_mid):
+    """Calculate neck deviation from ideal position"""
+    # Calculate horizontal deviation (how far head is from being centered over shoulders)
+    horizontal_deviation = abs(nose[0] - shoulder_mid[0])
+    
+    # Calculate vertical distance for normalization
+    vertical_distance = abs(nose[1] - shoulder_mid[1])
+    
+    # Avoid division by zero
+    if vertical_distance < 1:
+        return 0
+    
+    # Calculate angle using arctangent (more intuitive for head position)
+    angle = np.degrees(np.arctan(horizontal_deviation / vertical_distance))
+    
+    return min(angle, 90)  # Cap at 90 degrees
+
+def get_shoulder_trunk_angle(shoulder_mid, hip_mid=None):
+    """Calculate trunk lean angle from vertical"""
+    if hip_mid is None:
+        # For front view without hips, use shoulder height as reference
+        return 0  # Assume upright for front view
+    
+    # Vector from hip to shoulder (trunk direction)
+    trunk_vec = np.array(shoulder_mid) - np.array(hip_mid)
+    # Vertical reference (pointing up in image coordinates)
+    vertical_vec = np.array([0, -1])
+    
+    angle = angle_between_vectors(trunk_vec, vertical_vec)
+    # Return deviation from vertical
+    return abs(angle - 90) if angle > 90 else abs(90 - angle)
+
+def get_shoulder_symmetry(left_shoulder, right_shoulder):
+    """Calculate shoulder height difference in normalized units"""
+    height_diff = abs(left_shoulder[1] - right_shoulder[1])
+    
+    # Normalize by shoulder width to make it resolution-independent
+    shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
+    
+    if shoulder_width < 1:
+        return 0
+    
+    # Return as percentage of shoulder width
+    normalized_diff = (height_diff / shoulder_width) * 100
+    
+    return min(normalized_diff, 100)  # Cap at 100%
+#----extract features------
+# ----- Improved OWAS Scoring -----
+def get_owas_score(shoulder_angle, neck_angle, shoulder_symmetry=0, has_hips=True):
+    """
+    Improved OWAS scoring with realistic thresholds
+    """
+    # Adjust thresholds based on view type
+    if not has_hips:  # Front view - focus on neck and shoulder alignment
+        # Neck scoring (horizontal deviation in degrees)
+        if neck_angle < 5:        # Very good alignment
+            neck = 1
+        elif neck_angle < 15:     # Good alignment
+            neck = 2
+        elif neck_angle < 30:     # Moderate deviation
+            neck = 3
+        else:                     # Poor alignment
+            neck = 4
+        
+        # Shoulder symmetry scoring (percentage of shoulder width)
+        if shoulder_symmetry < 5:      # Very level shoulders
+            shoulder_sym = 1
+        elif shoulder_symmetry < 15:   # Slightly uneven
+            shoulder_sym = 2
+        elif shoulder_symmetry < 30:   # Moderately uneven
+            shoulder_sym = 3
+        else:                          # Very uneven
+            shoulder_sym = 4
+        
+        # Combined score for front view (take the worse of the two)
+        score = max(neck, shoulder_sym)
+        
+        # Additional penalties for extreme cases
+        if neck_angle > 45 or shoulder_symmetry > 40:
+            score = 4
+        
+    else:  # Side view - use full trunk analysis
+        # Trunk scoring (shoulder angle represents trunk lean)
+        if shoulder_angle < 10:
+            trunk = 1
+        elif shoulder_angle < 20:
+            trunk = 2
+        elif shoulder_angle < 35:
+            trunk = 3
+        else:
+            trunk = 4
+
+        # Neck scoring for side view
+        if neck_angle < 10:
+            neck = 1
+        elif neck_angle < 25:
+            neck = 2
+        elif neck_angle < 45:
+            neck = 3
+        else:
+            neck = 4
+
+        # Combine scores (take the worse score)
+        score = max(trunk, neck)
+
+    # Ensure score is within valid range
+    score = max(1, min(4, score))
+
+    messages = {
+        1: "Excellent posture - Well aligned",
+        2: "Good posture - Minor deviations", 
+        3: "Fair posture - Corrections needed",
+        4: "Poor posture - Immediate attention required"
+    }
+    
+    colors = {
+        1: (0, 255, 0),      # Green
+        2: (0, 255, 255),    # Yellow
+        3: (0, 165, 255),    # Orange
+        4: (0, 0, 255)       # Red
+    }
+    
+    return score, messages[score], colors[score]
+
+# ----- Time-Based Risk Assessment -----
+class PostureRiskAssessor:
+    def __init__(self):
+        self.posture_history = []
+        self.current_posture_start = None
+        self.current_posture_score = None
+        self.session_start_time = time.time()
+        
+        # Duration thresholds (in seconds) based on ergonomic guidelines
+        self.duration_thresholds = {
+            'excellent': {
+                'low_risk': 3600,      # 1 hour - can maintain excellent posture longer
+                'medium_risk': 7200,   # 2 hours
+                'high_risk': 10800     # 3 hours
+            },
+            'good': {
+                'low_risk': 1800,      # 30 minutes
+                'medium_risk': 3600,   # 1 hour
+                'high_risk': 5400      # 1.5 hours
+            },
+            'fair': {
+                'low_risk': 600,       # 10 minutes
+                'medium_risk': 1800,   # 30 minutes
+                'high_risk': 3600      # 1 hour
+            },
+            'poor': {
+                'low_risk': 120,       # 2 minutes
+                'medium_risk': 600,    # 10 minutes
+                'high_risk': 1800      # 30 minutes
+            }
+        }
+        
+        # Risk multipliers based on posture quality
+        self.risk_multipliers = {
+            1: 1.0,    # Excellent posture
+            2: 1.5,    # Good posture
+            3: 3.0,    # Fair posture
+            4: 5.0     # Poor posture
+        }
+        
+        # Cumulative statistics
+        self.cumulative_duration = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.posture_changes = 0
+        
+    def update_posture(self, owas_score):
+        """Update posture tracking with new OWAS score"""
+        current_time = time.time()
+        
+        # If this is the first reading or posture changed
+        if self.current_posture_score != owas_score:
+            # Record previous posture duration if it existed
+            if self.current_posture_start is not None and self.current_posture_score is not None:
+                duration = current_time - self.current_posture_start
+                self.posture_history.append({
+                    'score': self.current_posture_score,
+                    'duration': duration,
+                    'timestamp': self.current_posture_start
+                })
+                # Update cumulative duration
+                self.cumulative_duration[self.current_posture_score] += duration
+                self.posture_changes += 1
+            
+            # Start tracking new posture
+            self.current_posture_start = current_time
+            self.current_posture_score = owas_score
+        
+        # Update cumulative duration for current posture
+        if self.current_posture_start is not None:
+            current_duration = current_time - self.current_posture_start
+            temp_cumulative = self.cumulative_duration.copy()
+            temp_cumulative[self.current_posture_score] += current_duration
+            return temp_cumulative
+        
+        return self.cumulative_duration
+    
+    def get_current_posture_duration(self):
+        """Get duration of current posture"""
+        if self.current_posture_start is None:
+            return 0
+        return time.time() - self.current_posture_start
+    
+    def calculate_risk_score(self):
+        """Calculate comprehensive risk score based on posture history"""
+        current_time = time.time()
+        total_session_time = current_time - self.session_start_time
+        
+        if total_session_time < 60:  # Less than 1 minute
+            return 0, "Insufficient data", (128, 128, 128)
+        
+        # Get current cumulative durations
+        cumulative_duration = self.update_posture(self.current_posture_score)
+        
+        # Calculate weighted risk score
+        total_risk_score = 0
+        total_time = 0
+        
+        for score, duration in cumulative_duration.items():
+            if duration > 0:
+                # Apply risk multiplier
+                risk_contribution = duration * self.risk_multipliers[score]
+                total_risk_score += risk_contribution
+                total_time += duration
+        
+        if total_time == 0:
+            return 0, "No data", (128, 128, 128)
+        
+        # Normalize risk score (0-100 scale)
+        base_risk = (total_risk_score / total_time) * 20  # Scale to 0-100
+        
+        # Additional risk factors
+        current_posture_duration = self.get_current_posture_duration()
+        current_posture_category = self.get_posture_category(self.current_posture_score)
+        
+        # Duration-based risk multiplier
+        duration_risk = self.get_duration_risk_multiplier(
+            current_posture_duration, current_posture_category
+        )
+        
+        # Variability bonus (movement is good for health)
+        variability_bonus = min(self.posture_changes / (total_time / 600), 1.0)  # Every 10 minutes
+        
+        # Final risk score calculation
+        final_risk = base_risk * duration_risk * (1 - variability_bonus * 0.2)
+        final_risk = max(0, min(100, final_risk))
+        
+        # Determine risk level and color
+        if final_risk < 25:
+            risk_level = "Low Risk"
+            color = (0, 255, 0)  # Green
+        elif final_risk < 50:
+            risk_level = "Moderate Risk"
+            color = (0, 255, 255)  # Yellow
+        elif final_risk < 75:
+            risk_level = "High Risk"
+            color = (0, 165, 255)  # Orange
+        else:
+            risk_level = "Very High Risk"
+            color = (0, 0, 255)  # Red
+        
+        return final_risk, risk_level, color
+    
+    def get_posture_category(self, score):
+        """Convert OWAS score to posture category"""
+        categories = {1: 'excellent', 2: 'good', 3: 'fair', 4: 'poor'}
+        return categories.get(score, 'poor')
+    
+    def get_duration_risk_multiplier(self, duration, category):
+        """Get risk multiplier based on duration and posture category"""
+        thresholds = self.duration_thresholds[category]
+        
+        if duration < thresholds['low_risk']:
+            return 1.0
+        elif duration < thresholds['medium_risk']:
+            return 1.5
+        elif duration < thresholds['high_risk']:
+            return 2.0
+        else:
+            return 3.0
+    
+    def get_recommendations(self):
+        """Get personalized recommendations based on posture analysis"""
+        current_duration = self.get_current_posture_duration()
+        current_category = self.get_posture_category(self.current_posture_score)
+        recommendations = []
+        
+        # Duration-based recommendations
+        if current_duration > 1800:  # 30 minutes
+            recommendations.append("Take a break - you've been in this posture for over 30 minutes")
+        
+        # Posture-specific recommendations
+        if self.current_posture_score >= 3:
+            recommendations.append("Adjust your posture - current position may cause strain")
+        
+        if self.current_posture_score == 4:
+            recommendations.append("URGENT: Change position immediately to prevent injury")
+        
+        # Movement recommendations
+        if self.posture_changes < 3 and (time.time() - self.session_start_time) > 3600:
+            recommendations.append("Try to change positions more frequently")
+        
+        return recommendations
+    
+    def get_session_summary(self):
+        """Get comprehensive session summary"""
+        total_session_time = time.time() - self.session_start_time
+        cumulative_duration = self.update_posture(self.current_posture_score)
+        
+        summary = {
+            'session_duration': total_session_time,
+            'posture_distribution': {},
+            'posture_changes': self.posture_changes,
+            'average_change_interval': total_session_time / max(1, self.posture_changes)
+        }
+        
+        # Calculate posture distribution percentages
+        for score, duration in cumulative_duration.items():
+            if total_session_time > 0:
+                percentage = (duration / total_session_time) * 100
+                categories = {1: 'Excellent', 2: 'Good', 3: 'Fair', 4: 'Poor'}
+                summary['posture_distribution'][categories[score]] = {
+                    'duration': duration,
+                    'percentage': percentage
+                }
+        
+        return summary
+
+# ----- Keypoint Mapping with Confidence Check -----
+def get_point(k, index, w, h, confidence_threshold=0.3):
+    """Get keypoint with confidence check"""
+    if len(k) > index and len(k[index]) > 2:
+        confidence = k[index][2].item()
+        if confidence > confidence_threshold:
+            x = k[index][0].item() * w
+            y = k[index][1].item() * h
+            return (x, y), confidence
+    return None, 0
+
+def draw_posture_lines(frame, nose, shoulder_mid, hip_mid, left_shoulder, right_shoulder):
+    """Draw posture reference lines"""
+    h, w = frame.shape[:2]
+    
+    # Draw vertical reference line
+    cv2.line(frame, (w//2, 0), (w//2, h), (128, 128, 128), 1)
+    
+    # Draw spine line
+    if shoulder_mid and hip_mid:
+        cv2.line(frame, (int(shoulder_mid[0]), int(shoulder_mid[1])), 
+                (int(hip_mid[0]), int(hip_mid[1])), (255, 255, 0), 2)
+    
+    # Draw neck line
+    if nose and shoulder_mid:
+        cv2.line(frame, (int(nose[0]), int(nose[1])), 
+                (int(shoulder_mid[0]), int(shoulder_mid[1])), (0, 255, 255), 2)
+    
+    # Draw shoulder line
+    if left_shoulder and right_shoulder:
+        cv2.line(frame, (int(left_shoulder[0]), int(left_shoulder[1])), 
+                (int(right_shoulder[0]), int(right_shoulder[1])), (255, 0, 255), 2)
+
+def format_duration(seconds):
+    """Format duration in a readable format"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = int(seconds % 60)
+    
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    elif minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
+def draw_risk_dashboard(frame, risk_assessor):
+    """Draw comprehensive risk dashboard"""
+    h, w = frame.shape[:2]
+    
+    # Dashboard background
+    dashboard_height = 180
+    cv2.rectangle(frame, (w-350, 0), (w, dashboard_height), (0, 0, 0), -1)
+    cv2.rectangle(frame, (w-350, 0), (w, dashboard_height), (255, 255, 255), 2)
+    
+    # Get risk information
+    risk_score, risk_level, risk_color = risk_assessor.calculate_risk_score()
+    current_duration = risk_assessor.get_current_posture_duration()
+    session_summary = risk_assessor.get_session_summary()
+    
+    # Title
+    cv2.putText(frame, "RISK DASHBOARD", (w-340, 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Risk Score
+    cv2.putText(frame, f"Risk Score: {risk_score:.1f}/100", (w-340, 45), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, risk_color, 2)
+    cv2.putText(frame, f"Level: {risk_level}", (w-340, 65), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, risk_color, 2)
+    
+    # Current posture duration
+    cv2.putText(frame, f"Current: {format_duration(current_duration)}", (w-340, 85), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    # Session time
+    cv2.putText(frame, f"Session: {format_duration(session_summary['session_duration'])}", (w-340, 105), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    # Posture changes
+    cv2.putText(frame, f"Changes: {session_summary['posture_changes']}", (w-340, 125), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+    
+    # Posture distribution (top 2)
+    y_pos = 145
+    for category, data in list(session_summary['posture_distribution'].items())[:2]:
+        if data['percentage'] > 0:
+            cv2.putText(frame, f"{category}: {data['percentage']:.1f}%", (w-340, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            y_pos += 15
+
+def draw_recommendations(frame, risk_assessor):
+    """Draw recommendations on frame"""
+    recommendations = risk_assessor.get_recommendations()
+    
+    if recommendations:
+        h, w = frame.shape[:2]
+        # Background for recommendations
+        rec_height = len(recommendations) * 25 + 20
+        cv2.rectangle(frame, (10, h-rec_height-10), (w-360, h-10), (0, 0, 0), -1)
+        cv2.rectangle(frame, (10, h-rec_height-10), (w-360, h-10), (255, 255, 255), 2)
+        
+        cv2.putText(frame, "RECOMMENDATIONS:", (20, h-rec_height+10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        for i, rec in enumerate(recommendations):
+            cv2.putText(frame, f"• {rec}", (20, h-rec_height+35+i*25), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+# ----- Load YOLOv8 Pose Model -----
+try:
+    model = YOLO("yolov8n-pose.pt")
+    print("Model loaded successfully!")
+except Exception as e:
+    print(f"Error loading model: {e}")
+    exit()
+
+# Webcam Setup
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open webcam")
+    exit()
+
+# Initialize risk assessor
+risk_assessor = PostureRiskAssessor()
+
+# Smoothing buffers (reduced size for faster response)
+neck_angle_buffer = deque(maxlen=5)
+shoulder_angle_buffer = deque(maxlen=5)
+
+# ----- CSV Logging Setup -----
+csv_filename = f'posture_features_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+csv_file = open(csv_filename, 'w', newline='', encoding='utf-8')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow([
+    'timestamp', 'neck_angle', 'shoulder_angle', 'shoulder_symmetry', 'OWAS_score',
+    'OWAS_message', 'risk_score', 'risk_level', 'recommendations'
+])
+
+print("Starting posture detection with risk assessment... Press 'q' to quit, 'r' to reset session")
+cv2.namedWindow("Posture Monitor with Risk Assessment - Press 'q' to Quit | 'r' to Reset", cv2.WND_PROP_FULLSCREEN)
+cv2.setWindowProperty("Posture Monitor with Risk Assessment - Press 'q' to Quit | 'r' to Reset", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        print("Error: Could not read frame")
+        break
+
+    # Flip frame horizontally for mirror effect
+    frame = cv2.flip(frame, 1)
+    
+    # Run pose detection
+    results = model(frame, verbose=False)
+    
+    if results and len(results) > 0:
+        # Get the annotated frame
+        annotated_frame = results[0].plot()
+        
+        # Extract keypoints
+        keypoints = results[0].keypoints
+        
+        if keypoints is not None and keypoints.data is not None and len(keypoints.data) > 0:
+            kps = keypoints.data[0]  # First person detected
+            h, w = frame.shape[:2]
+            
+            # Extract keypoints with confidence check
+            nose_data = get_point(kps, 0, w, h)  # Nose
+            left_shoulder_data = get_point(kps, 5, w, h)  # Left shoulder
+            right_shoulder_data = get_point(kps, 6, w, h)  # Right shoulder
+            left_hip_data = get_point(kps, 11, w, h)  # Left hip
+            right_hip_data = get_point(kps, 12, w, h)  # Right hip
+            
+            # Check minimum required keypoints (nose and shoulders)
+            if (nose_data[0] is not None and 
+                left_shoulder_data[0] is not None and 
+                right_shoulder_data[0] is not None):
+                
+                # Extract coordinates
+                nose = nose_data[0]
+                left_shoulder = left_shoulder_data[0]
+                right_shoulder = right_shoulder_data[0]
+                
+                # Calculate shoulder midpoint
+                shoulder_mid = ((left_shoulder[0] + right_shoulder[0]) / 2, 
+                              (left_shoulder[1] + right_shoulder[1]) / 2)
+                
+                # Check if we have hip data
+                has_hips = (left_hip_data[0] is not None and right_hip_data[0] is not None)
+                
+                if has_hips:
+                    left_hip = left_hip_data[0]
+                    right_hip = right_hip_data[0]
+                    hip_mid = ((left_hip[0] + right_hip[0]) / 2, 
+                              (left_hip[1] + right_hip[1]) / 2)
+                    shoulder_angle = get_shoulder_trunk_angle(shoulder_mid, hip_mid)
+                else:
+                    hip_mid = None
+                    shoulder_angle = 0  # Front view assumption
+                
+                # Calculate angles
+                neck_angle = get_neck_angle(nose, shoulder_mid)
+                shoulder_symmetry = get_shoulder_symmetry(left_shoulder, right_shoulder)
+                
+                # Add to smoothing buffer
+                neck_angle_buffer.append(neck_angle)
+                shoulder_angle_buffer.append(shoulder_angle)
+                
+                # Calculate smoothed angles
+                neck_angle_avg = sum(neck_angle_buffer) / len(neck_angle_buffer)
+                shoulder_angle_avg = sum(shoulder_angle_buffer) / len(shoulder_angle_buffer)
+                
+                # Get OWAS score
+                score, message, color = get_owas_score(shoulder_angle_avg, neck_angle_avg, 
+                                                     shoulder_symmetry, has_hips)
+                
+                # Update risk assessor
+                risk_assessor.update_posture(score)
+                
+                # Get risk info and recommendations
+                risk_score, risk_level, _ = risk_assessor.calculate_risk_score()
+                recommendations = risk_assessor.get_recommendations()
+                
+                # --- CSV Logging ---
+                csv_writer.writerow([
+                    datetime.now().isoformat(),
+                    round(neck_angle_avg, 2),
+                    round(shoulder_angle_avg, 2),
+                    round(shoulder_symmetry, 2),
+                    score,
+                    message,
+                    round(risk_score, 2),
+                    risk_level,
+                    " | ".join(recommendations)
+                ])
+                csv_file.flush()
+                
+                # Draw posture lines
+                draw_posture_lines(annotated_frame, nose, shoulder_mid, hip_mid, 
+                                 left_shoulder, right_shoulder)
+                
+                # Display basic posture information
+                cv2.putText(annotated_frame, f"OWAS Score: {score}", (30, 40),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                cv2.putText(annotated_frame, message, (30, 70),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # Display angles and view type
+                view_type = "Side View" if has_hips else "Front View"
+                cv2.putText(annotated_frame, f"View: {view_type}", (30, 100),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                if has_hips:
+                    cv2.putText(annotated_frame, f"Trunk: {int(shoulder_angle_avg)}deg", (30, 130),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                cv2.putText(annotated_frame, f"Neck: {int(neck_angle_avg)}deg", (30, 160),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(annotated_frame, f"Shoulder Diff: {int(shoulder_symmetry)}%", (30, 190),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                # Draw risk dashboard
+                draw_risk_dashboard(annotated_frame, risk_assessor)
+                
+                # Draw recommendations
+                draw_recommendations(annotated_frame, risk_assessor)
+                
+                # Highlight bad posture
+                if score >= 3:
+                    cv2.rectangle(annotated_frame, (0, 0), (w, h), color, 8)
+                    if score == 4:
+                        cv2.putText(annotated_frame, "POOR POSTURE!", (w // 2 - 120, h // 2),
+                                   cv2.FONT_HERSHEY_DUPLEX, 1.2, color, 3)
+                
+                # Add confidence information
+                avg_confidence = np.mean([nose_data[1], left_shoulder_data[1], right_shoulder_data[1]])
+                cv2.putText(annotated_frame, f"Confidence: {avg_confidence:.2f}", (30, 220),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        else:
+            cv2.putText(annotated_frame, "No person detected", (30, 40),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    else:
+        annotated_frame = frame.copy()
+        cv2.putText(annotated_frame, "No detection results", (30, 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    cv2.imshow("Posture Monitor with Risk Assessment - Press 'q' to Quit | 'r' to Reset", annotated_frame)
+    
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('r'):
+        # Reset session
+        risk_assessor = PostureRiskAssessor()
+        neck_angle_buffer.clear()
+        shoulder_angle_buffer.clear()
+        print("Session reset!")
+
+# Print final session summary
+print("\n" + "="*50)
+print("FINAL SESSION SUMMARY")
+print("="*50)
+
+final_summary = risk_assessor.get_session_summary()
+final_risk_score, final_risk_level, _ = risk_assessor.calculate_risk_score()
+
+print(f"Total Session Duration: {format_duration(final_summary['session_duration'])}")
+print(f"Final Risk Score: {final_risk_score:.1f}/100 ({final_risk_level})")
+print(f"Total Posture Changes: {final_summary['posture_changes']}")
+print(f"Average Change Interval: {format_duration(final_summary['average_change_interval'])}")
+
+print("\nPosture Distribution:")
+for category, data in final_summary['posture_distribution'].items():
+    if data['percentage'] > 0:
+        print(f"  {category}: {format_duration(data['duration'])} ({data['percentage']:.1f}%)")
+
+# Health recommendations based on session
+print("\nHealth Recommendations:")
+if final_risk_score >= 75:
+    print("  • URGENT: Schedule a break and consult ergonomic guidelines")
+    print("  • Consider adjusting your workstation setup")
+    print("  • Implement regular posture breaks every 30 minutes")
+elif final_risk_score >= 50:
+    print("  • Take more frequent breaks to change posture")
+    print("  • Consider ergonomic adjustments to your workspace")
+    print("  • Practice neck and shoulder stretches")
+elif final_risk_score >= 25:
+    print("  • Good posture habits, maintain current practices")
+    print("  • Continue to take regular breaks")
+else:
+    print("  • Excellent posture management!")
+    print("  • Keep up the good work with regular movement")
+
+# Export session data (optional)
+session_data = {
+    'timestamp': datetime.now().isoformat(),
+    'session_duration': final_summary['session_duration'],
+    'risk_score': final_risk_score,
+    'risk_level': final_risk_level,
+    'posture_distribution': final_summary['posture_distribution'],
+    'posture_changes': final_summary['posture_changes'],
+    'posture_history': [
+        {
+            'score': entry['score'],
+            'duration': entry['duration'],
+            'timestamp': datetime.fromtimestamp(entry['timestamp']).isoformat()
+        } for entry in risk_assessor.posture_history
+    ]
+}
+
+# Save session data to file
+try:
+    with open(f'posture_session_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json', 'w') as f:
+        json.dump(session_data, f, indent=2)
+    print(f"\nSession data saved to posture_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+except Exception as e:
+    print(f"Could not save session data: {e}")
+
+cap.release()
+cv2.destroyAllWindows()
+csv_file.close()
+print(f"\nFeature data saved to {csv_filename}")
+print("\nPosture detection ended. Thank you for using the posture risk assessment system!")
+
+def log_session_summary_to_csv(summary, risk_score, risk_level, recommendations, filename=None):
+    """Log session summary and health recommendations to a CSV file."""
+    import csv
+    from datetime import datetime
+
+    if filename is None:
+        filename = f'posture_session_summary_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'timestamp', 'session_duration', 'risk_score', 'risk_level',
+            'posture_changes', 'average_change_interval', 'posture_distribution', 'health_recommendations'
+        ])
+        posture_dist_str = "; ".join(
+            [f"{cat}: {format_duration(data['duration'])} ({data['percentage']:.1f}%)"
+             for cat, data in summary['posture_distribution'].items() if data['percentage'] > 0]
+        )
+        writer.writerow([
+            datetime.now().isoformat(),
+            format_duration(summary['session_duration']),
+            f"{risk_score:.1f}",
+            risk_level,
+            summary['posture_changes'],
+            format_duration(summary['average_change_interval']),
+            posture_dist_str,
+            " | ".join(recommendations)
+        ])
+    print(f"\nSession summary saved to {filename}")
+
+# --- After your session ends, add this call ---
+# Example usage after printing health recommendations:
+health_recs = []
+if final_risk_score >= 75:
+    health_recs = [
+        "URGENT: Schedule a break and consult ergonomic guidelines",
+        "Consider adjusting your workstation setup",
+        "Implement regular posture breaks every 30 minutes"
+    ]
+elif final_risk_score >= 50:
+    health_recs = [
+        "Take more frequent breaks to change posture",
+        "Consider ergonomic adjustments to your workspace",
+        "Practice neck and shoulder stretches"
+    ]
+elif final_risk_score >= 25:
+    health_recs = [
+        "Good posture habits, maintain current practices",
+        "Continue to take regular breaks"
+    ]
+else:
+    health_recs = [
+        "Excellent posture management!",
+        "Keep up the good work with regular movement"
+    ]
+
+log_session_summary_to_csv(final_summary, final_risk_score, final_risk_level, health_recs)
